@@ -850,8 +850,8 @@ def render_sdt_workflow_placeholder(export_basename: str):
     st.caption("SDT parsing/processing is not implemented yet. TIFF workflow is disabled to keep the app fast and stable.")
 
     st.info(
-        "Когда SDT-парсер будет готов, он будет возвращать те же метрики (tm/t1/t2/a1), "
-        "что сейчас использует модуль статистики и построения графиков."
+        "When the SDT parser is ready, it will return the same metrics (tm/t1/t2/a1) "
+        "that your current statistics/plotting module expects."
     )
 
     uploaded_files = st.file_uploader(
@@ -869,82 +869,118 @@ def render_sdt_workflow_placeholder(export_basename: str):
 
     st.divider()
     st.markdown("**Export**")
-    st.caption("Сейчас экспорт отключен, т.к. обработка SDT не реализована.")
+    st.caption("Export is currently disabled because SDT processing is not implemented yet.")
 
 
 def render_processed_analysis(export_basename: str):
-    uploaded_files = st.file_uploader(
-        "Drop .asc files here",
-        type=["asc"],
-        accept_multiple_files=True,
-        key="processed_uploader",
+    st.markdown(
+        """
+        <div class="flim-panel">
+            <h3>Notebook analysis</h3>
+            <p>Upload processed FLIM data (<code>.asc</code>), then build statistics and export tables/plots.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if not uploaded_files:
+    cache_key = "flim_processed_cache"
+
+    reset_col, upload_col = st.columns([1, 3])
+    with reset_col:
+        if st.button("Reset FLIM session", key="flim_reset_processed", type="secondary"):
+            st.session_state.pop(cache_key, None)
+            st.rerun()
+
+    with upload_col:
+        uploaded_files = st.file_uploader(
+            "Drop .asc files here",
+            type=["asc"],
+            accept_multiple_files=True,
+            key="processed_uploader",
+        )
+
+    if uploaded_files:
+        groups = {}
+        skipped = []
+        logs = []
+
+        for uploaded in uploaded_files:
+            filename = uploaded.name
+            match = name_pattern.match(filename)
+            if not match:
+                skipped.append(f"{filename} (name does not match required pattern)")
+                continue
+
+            base = match.group("base")
+            num = int(match.group("num"))
+
+            rows, used_encoding, err = parse_uploaded_file(uploaded)
+            if err:
+                skipped.append(f"{filename} ({err})")
+                continue
+
+            logs.append(f"{filename}: {used_encoding}")
+            for roi, metric, mu in rows:
+                groups.setdefault(base, []).append([num, filename, roi, metric, mu])
+
+        if logs:
+            with st.expander("Read log"):
+                for line in logs:
+                    st.write(line)
+
+        if skipped:
+            st.warning("Some files were skipped:")
+            for item in skipped:
+                st.write(f"- {item}")
+
+        if not groups:
+            st.error("No valid data found.")
+            return
+
+        st.success(f"Groups found: {len(groups)}")
+
+        group_tables = {}
+        for base_name in sorted(groups.keys()):
+            df = pd.DataFrame(
+                groups[base_name],
+                columns=["FileNum", "File", "ROI", "type", "mu"],
+            )
+
+            table = df.pivot_table(
+                index=["FileNum", "ROI"],
+                columns="type",
+                values="mu",
+                aggfunc="first",
+            ).round(3)
+
+            group_tables[base_name] = table
+
+        plot_df = build_plot_df(group_tables)
+        plot_metrics = [metric for metric in wanted if metric in plot_df.columns]
+        plot_df = remove_zero_values(plot_df, plot_metrics)
+
+        st.session_state[cache_key] = {
+            "group_tables": group_tables,
+            "plot_df": plot_df,
+            "plot_metrics": plot_metrics,
+        }
+    elif cache_key in st.session_state:
+        cached = st.session_state[cache_key]
+        group_tables = cached["group_tables"]
+        plot_df = cached["plot_df"]
+        plot_metrics = cached["plot_metrics"]
+        st.success("Loaded FLIM data from this session.")
+    else:
         st.info("Upload one or more .asc files to start.")
         return
 
-    groups = {}
-    skipped = []
-    logs = []
-
-    for uploaded in uploaded_files:
-        filename = uploaded.name
-        match = name_pattern.match(filename)
-        if not match:
-            skipped.append(f"{filename} (name does not match required pattern)")
-            continue
-
-        base = match.group("base")
-        num = int(match.group("num"))
-
-        rows, used_encoding, err = parse_uploaded_file(uploaded)
-        if err:
-            skipped.append(f"{filename} ({err})")
-            continue
-
-        logs.append(f"{filename}: {used_encoding}")
-        for roi, metric, mu in rows:
-            groups.setdefault(base, []).append([num, filename, roi, metric, mu])
-
-    if logs:
-        with st.expander("Read log"):
-            for line in logs:
-                st.write(line)
-
-    if skipped:
-        st.warning("Some files were skipped:")
-        for item in skipped:
-            st.write(f"- {item}")
-
-    if not groups:
-        st.error("No valid data found.")
-        return
-
-    st.success(f"Groups found: {len(groups)}")
-
-    group_tables = {}
-    for base_name in sorted(groups.keys()):
-        df = pd.DataFrame(
-            groups[base_name],
-            columns=["FileNum", "File", "ROI", "type", "mu"],
-        )
-
-        table = df.pivot_table(
-            index=["FileNum", "ROI"],
-            columns="type",
-            values="mu",
-            aggfunc="first",
-        ).round(3)
-
-        group_tables[base_name] = table
-
-    plot_df = build_plot_df(group_tables)
-    plot_metrics = [metric for metric in wanted if metric in plot_df.columns]
-    plot_df = remove_zero_values(plot_df, plot_metrics)
-
     st.subheader("Preview")
-    preview_group = st.selectbox("Select group", list(group_tables.keys()))
+    group_names = list(group_tables.keys())
+    st.session_state.setdefault("flim_preview_group", group_names[0] if group_names else None)
+    if st.session_state["flim_preview_group"] not in group_names:
+        st.session_state["flim_preview_group"] = group_names[0] if group_names else None
+
+    preview_group = st.selectbox("Select group", group_names, key="flim_preview_group")
     st.dataframe(group_tables[preview_group], use_container_width=True)
 
     st.subheader("Plot data")
@@ -958,29 +994,32 @@ def render_processed_analysis(export_basename: str):
     controls_col, sheet_col = st.columns([1.2, 1])
 
     with controls_col:
-        selected_metric = st.selectbox("Metric for stats and chart", plot_metrics, index=0)
+        if "flim_selected_metric" in st.session_state and st.session_state["flim_selected_metric"] not in plot_metrics:
+            st.session_state.pop("flim_selected_metric", None)
+        selected_metric = st.selectbox("Metric for stats and chart", plot_metrics, key="flim_selected_metric")
         chart_type = st.radio(
             "Chart type",
             options=["Scatter plot", "Box plot", "Violin plot"],
             index=0,
             horizontal=True,
+            key="flim_chart_type",
         )
         default_title = f"{selected_metric} across groups"
-        chart_title = st.text_input("Chart title", value=default_title)
-        x_axis_label = st.text_input("X axis label", value="Cell type")
-        y_axis_label = st.text_input("Y axis label", value=selected_metric)
-        point_alpha = st.slider("Point opacity", min_value=0.10, max_value=1.00, value=0.85, step=0.05)
-        box_alpha = st.slider("Box opacity", min_value=0.10, max_value=1.00, value=0.55, step=0.05)
-        jitter_amount = st.slider("Point spread", min_value=0.00, max_value=0.50, value=0.22, step=0.01)
-        show_mean_sd_labels = st.checkbox("Show mean +/- sd under chart", value=True)
+        chart_title = st.text_input("Chart title", value=st.session_state.get("flim_chart_title", default_title), key="flim_chart_title")
+        x_axis_label = st.text_input("X axis label", value=st.session_state.get("flim_x_axis_label", "Cell type"), key="flim_x_axis_label")
+        y_axis_label = st.text_input("Y axis label", value=st.session_state.get("flim_y_axis_label", selected_metric), key="flim_y_axis_label")
+        point_alpha = st.slider("Point opacity", min_value=0.10, max_value=1.00, value=float(st.session_state.get("flim_point_alpha", 0.85)), step=0.05, key="flim_point_alpha")
+        box_alpha = st.slider("Box opacity", min_value=0.10, max_value=1.00, value=float(st.session_state.get("flim_box_alpha", 0.55)), step=0.05, key="flim_box_alpha")
+        jitter_amount = st.slider("Point spread", min_value=0.00, max_value=0.50, value=float(st.session_state.get("flim_jitter_amount", 0.22)), step=0.01, key="flim_jitter_amount")
+        show_mean_sd_labels = st.checkbox("Show mean +/- sd under chart", value=bool(st.session_state.get("flim_show_mean_sd_labels", True)), key="flim_show_mean_sd_labels")
 
     with sheet_col:
-        include_all_groups_sheet = st.checkbox("Include All_Groups sheet", value=True)
-        include_plot_sheet = st.checkbox("Include plot sheet", value=True)
-        include_summary_sheet = st.checkbox("Include summary sheet", value=True)
-        include_descriptive_sheet = st.checkbox("Include descriptive_stats sheet", value=True)
-        include_overall_sheet = st.checkbox("Include overall_test sheet", value=True)
-        include_pairwise_sheet = st.checkbox("Include pairwise_stats sheet", value=True)
+        include_all_groups_sheet = st.checkbox("Include All_Groups sheet", value=bool(st.session_state.get("flim_include_all_groups_sheet", True)), key="flim_include_all_groups_sheet")
+        include_plot_sheet = st.checkbox("Include plot sheet", value=bool(st.session_state.get("flim_include_plot_sheet", True)), key="flim_include_plot_sheet")
+        include_summary_sheet = st.checkbox("Include summary sheet", value=bool(st.session_state.get("flim_include_summary_sheet", True)), key="flim_include_summary_sheet")
+        include_descriptive_sheet = st.checkbox("Include descriptive_stats sheet", value=bool(st.session_state.get("flim_include_descriptive_sheet", True)), key="flim_include_descriptive_sheet")
+        include_overall_sheet = st.checkbox("Include overall_test sheet", value=bool(st.session_state.get("flim_include_overall_sheet", True)), key="flim_include_overall_sheet")
+        include_pairwise_sheet = st.checkbox("Include pairwise_stats sheet", value=bool(st.session_state.get("flim_include_pairwise_sheet", True)), key="flim_include_pairwise_sheet")
 
     grouped_stats, overall_df, pairwise_df = calculate_statistics(plot_df, "name", selected_metric)
     summary_df = build_summary_df(selected_metric)
@@ -1018,6 +1057,7 @@ def render_processed_analysis(export_basename: str):
                 "Pairwise brackets on chart",
                 options=pairwise_options,
                 help="Selected comparisons will be shown as brackets with adjusted p-values when available.",
+                key="flim_selected_pairs",
             )
         pairwise_annotations = get_pairwise_annotation_rows(pairwise_df, selected_pairs)
 
