@@ -21,7 +21,6 @@ def biexp(t, a1, T1, a2, T2, bg):
     return a1 * np.exp(-t / T1) + a2 * np.exp(-t / T2) + bg
 
 def fit_row(args):
-    """Один поток = одна строка пикселей"""
     row_idx, row_data, times_local, n_photons_min = args
     results = []
     for j in range(row_data.shape[0]):
@@ -52,7 +51,6 @@ def fit_row(args):
 # ============================================================
 
 def load_sdt(file_bytes):
-    """Загружает .sdt из байтов"""
     with tempfile.NamedTemporaryFile(suffix='.sdt', delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -65,8 +63,7 @@ def load_sdt(file_bytes):
     return data, times
 
 def run_binning(data, bin_size=3):
-    binned = uniform_filter(data, size=(bin_size, bin_size, 1)) * (bin_size ** 2)
-    return binned
+    return uniform_filter(data, size=(bin_size, bin_size, 1)) * (bin_size ** 2)
 
 def run_fitting_parallel(binned, times, n_photons_min=50, progress_bar=None, status_text=None):
     h, w      = binned.shape[:2]
@@ -78,7 +75,7 @@ def run_fitting_parallel(binned, times, n_photons_min=50, progress_bar=None, sta
     map_Tm = np.full((h, w), np.nan)
 
     completed = 0
-   with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor() as executor:
         futures = {executor.submit(fit_row, args): args[0] for args in args_list}
         for future in as_completed(futures):
             row_idx, row_results = future.result()
@@ -92,7 +89,7 @@ def run_fitting_parallel(binned, times, n_photons_min=50, progress_bar=None, sta
             if progress_bar is not None:
                 progress_bar.progress(completed / h)
             if status_text is not None:
-                status_text.text(f'Fitting: {completed}/{h} строк обработано...')
+                status_text.text(f'Fitting: {completed}/{h} rows done...')
 
     intensity = binned.sum(axis=2)
     return map_a1, map_T1, map_T2, map_Tm, intensity
@@ -111,8 +108,8 @@ def run_cellpose(intensity):
     return masks, img_norm
 
 def extract_per_cell(masks, intensity, map_a1, map_T1, map_T2, map_Tm, group_name, file_num):
-    rows     = []
-    n_cells  = masks.max()
+    rows    = []
+    n_cells = masks.max()
 
     for cell_id in range(1, n_cells + 1):
         cell_mask = masks == cell_id
@@ -158,21 +155,19 @@ def extract_per_cell(masks, intensity, map_a1, map_T1, map_T2, map_Tm, group_nam
 
     return pd.DataFrame(rows)
 
-def build_mask_figure(img_norm, masks, cytoplasm_display=True):
+def build_mask_figure(img_norm, masks):
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
 
     axes[0].imshow(img_norm, cmap='hot')
-    axes[0].set_title('Интенсивность НАДH')
+    axes[0].set_title('NADH intensity')
     axes[0].axis('off')
 
-    # Строим маску цитоплазмы для отображения
     cyto_display = np.zeros_like(masks)
     for cell_id in range(1, masks.max() + 1):
         cell_mask         = masks == cell_id
-        cell_intensity    = img_norm[cell_mask] if img_norm is not None else None
         nuclear_threshold = np.percentile(img_norm[cell_mask], 25)
         dark_mask         = cell_mask & (img_norm < nuclear_threshold)
-        labeled_dark, n  = label(dark_mask)
+        labeled_dark, n   = label(dark_mask)
         if n > 0:
             sizes   = [np.sum(labeled_dark == r) for r in range(1, n + 1)]
             nucleus = labeled_dark == (np.argmax(sizes) + 1)
@@ -196,7 +191,7 @@ def build_mask_figure(img_norm, masks, cytoplasm_display=True):
             color='white', fontsize=7, fontweight='bold',
             ha='center', va='center',
         )
-    axes[1].set_title(f'Цитоплазма — {masks.max()} клеток')
+    axes[1].set_title(f'Cytoplasm masks — {masks.max()} cells')
     axes[1].axis('off')
 
     plt.tight_layout()
@@ -222,46 +217,43 @@ def df_to_excel(df):
 def render_sdt_workflow(export_basename: str):
     st.subheader("SDT workflow")
     st.caption(
-        "Drag and drop .sdt file for automatical fitting, "
-        "and export notebooks to analyse"
+        "Drop your .sdt file — automatic fitting, Cellpose cell segmentation, "
+        "and export in the same format as notebook analysis."
     )
 
-    # Настройки
     col1, col2 = st.columns(2)
     with col1:
-        group_name    = st.text_input("group name", value="tumour",
-                                      help="example: tumour, CAFs, control")
-        file_num      = st.number_input("file num", min_value=1, value=1, step=1)
+        group_name    = st.text_input("Group name", value="tumour",
+                                      help="e.g. tumour, CAFs, control")
+        file_num      = st.number_input("File number", min_value=1, value=1, step=1)
         bin_size      = st.slider("Binning", 1, 7, 3, step=2,
-                                  help="same binning from SPCImage")
+                                  help="Same binning as in SPCImage")
     with col2:
-        n_photons_min = st.slider("min photons", 20, 200, 50, step=10,
-                                  help="no pixels above threshold")
-        st.info("standart for NADPH - bin=3 min photons=50")
+        n_photons_min = st.slider("Min photons", 20, 200, 50, step=10,
+                                  help="Pixels below threshold are skipped")
+        st.info("Standard for NADH: bin=3, min photons=50")
 
     uploaded = st.file_uploader(
-        "drop your .sdt here", type=["sdt", "SDT"], key="sdt_main_uploader"
+        "Drop your .sdt file here", type=["sdt", "SDT"], key="sdt_main_uploader"
     )
 
     if not uploaded:
-        st.info("drop .sdt to start")
+        st.info("Upload a .sdt file to start.")
         return
 
-    st.success(f"uploaded: **{uploaded.name}**")
+    st.success(f"Uploaded: **{uploaded.name}**")
 
-    if not st.button("▶ star analysis", type="primary"):
+    if not st.button("▶ Start analysis", type="primary"):
         return
 
-    # ── Шаг 1: загрузка ──────────────────────────────────────
-    with st.spinner("oh so beautiful let me see..."):
+    with st.spinner("Reading file and binning..."):
         data, times = load_sdt(uploaded.getvalue())
         binned      = run_binning(data, bin_size)
         del data
-    st.success(f"✓ got it — {binned.shape[0]}×{binned.shape[1]} pixels")
+    st.success(f"✓ File read — {binned.shape[0]}×{binned.shape[1]} pixels")
 
-    # ── Шаг 2: fitting ───────────────────────────────────────
-    st.markdown("**now im fitting them**")
-    st.caption("wait a bit")
+    st.markdown("**Fitting decay curves...**")
+    st.caption("This will take a few minutes.")
     progress    = st.progress(0)
     status_text = st.empty()
 
@@ -270,51 +262,45 @@ def render_sdt_workflow(export_basename: str):
     )
     del binned
     status_text.empty()
-    st.success("✓ Fitting is done!")
+    st.success("✓ Fitting done!")
 
-    # ── Шаг 3: Cellpose ──────────────────────────────────────
-    with st.spinner("Cellpose is looking for your tiny shiny cells..."):
+    with st.spinner("Cellpose is finding your cells..."):
         masks, img_norm = run_cellpose(intensity)
-    st.success(f"✓ we found: **{masks.max()}**")
+    st.success(f"✓ Found: **{masks.max()} cells**")
 
-    # ── Шаг 4: картинка с масками ────────────────────────────
-    st.markdown("**i'll show you something**")
+    st.markdown("**Cell masks — visual check**")
     fig = build_mask_figure(img_norm, masks)
     st.pyplot(fig, use_container_width=True)
     pdf_buf = fig_to_pdf(fig)
     plt.close(fig)
 
-    # ── Шаг 5: параметры по клеткам ──────────────────────────
-    with st.spinner("but first i need to calculate some a1, tm.. you know..."):
+    with st.spinner("Extracting parameters per cell..."):
         df = extract_per_cell(
             masks, intensity, map_a1, map_T1, map_T2, map_Tm,
             group_name, file_num,
         )
 
-    st.success(f"✓cells with data: **{len(df)}**")
-    st.markdown("**results**")
+    st.success(f"✓ Cells with data: **{len(df)}**")
+    st.markdown("**Results**")
     st.dataframe(df, use_container_width=True)
 
-    # ── Шаг 6: экспорт ───────────────────────────────────────
     export_name = f"{export_basename}_{group_name}_file{int(file_num)}"
     excel_buf   = df_to_excel(df)
 
     dl1, dl2 = st.columns(2)
     with dl1:
         st.download_button(
-            "📥 download exel",
+            "📥 Download Excel",
             data=excel_buf,
             file_name=f"{export_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with dl2:
         st.download_button(
-            "📥download masks PDF",
+            "📥 Download masks PDF",
             data=pdf_buf,
             file_name=f"{export_name}_masks.pdf",
             mime="application/pdf",
         )
 
-    st.info(
-        "we got it! shine bright like a diamond!"
-    )
+    st.info("Excel is ready for notebook analysis — upload it there for stats and plots!")
