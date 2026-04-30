@@ -7,7 +7,7 @@ import pandas as pd
 from io import BytesIO
 import tempfile, os, gc
 from scipy.optimize import curve_fit
-from scipy.ndimage import uniform_filter, binary_dilation, label
+from scipy.ndimage import uniform_filter1d, binary_dilation, label
 from cellpose import models as cellpose_models
 import streamlit as st
 import sdtfile
@@ -46,7 +46,7 @@ def fit_row(args):
     return row_idx, results
 
 # ============================================================
-# ОСНОВНЫЕ ФУНКЦИИ
+# ЗАГРУЗКА
 # ============================================================
 
 def load_sdt(file_bytes):
@@ -61,33 +61,50 @@ def load_sdt(file_bytes):
         os.unlink(tmp_path)
     return data, times
 
-def run_binning(data, bin_size=3):
-    return uniform_filter(data, size=(bin_size, bin_size, 1)) * (bin_size ** 2)
+# ============================================================
+# BINNING + FITTING ПОСТРОЧНО — не держим весь массив в памяти
+# ============================================================
 
-def run_fitting(binned, times, n_photons_min=50, progress_bar=None, status_text=None):
-    """Построчный fitting — экономит память на облаке"""
-    h, w = binned.shape[:2]
+def run_binning_and_fitting(data, times, bin_size=3, n_photons_min=50,
+                             progress_bar=None, status_text=None):
+    h, w  = data.shape[0], data.shape[1]
+    half  = bin_size // 2
 
-    map_a1 = np.full((h, w), np.nan)
-    map_T1 = np.full((h, w), np.nan)
-    map_T2 = np.full((h, w), np.nan)
-    map_Tm = np.full((h, w), np.nan)
+    map_a1    = np.full((h, w), np.nan)
+    map_T1    = np.full((h, w), np.nan)
+    map_T2    = np.full((h, w), np.nan)
+    map_Tm    = np.full((h, w), np.nan)
+    intensity = np.zeros((h, w), dtype=np.float32)
 
     for i in range(h):
-        _, row_results = fit_row((i, binned[i], times, n_photons_min))
+        # Берём только нужные строки для binning — не весь массив
+        i_min      = max(0, i - half)
+        i_max      = min(h, i + half + 1)
+        row_binned = data[i_min:i_max].mean(axis=0).astype(np.float32)
+
+        # Binning по столбцам через скользящее среднее
+        row_binned = uniform_filter1d(row_binned, size=bin_size, axis=0)
+
+        intensity[i] = row_binned.sum(axis=1)
+
+        _, row_results = fit_row((i, row_binned, times, n_photons_min))
         for j, res in enumerate(row_results):
             if res:
                 map_a1[i, j] = res[0]
                 map_T1[i, j] = res[1]
                 map_T2[i, j] = res[2]
                 map_Tm[i, j] = res[3]
+
         if progress_bar is not None:
             progress_bar.progress((i + 1) / h)
         if status_text is not None:
-            status_text.text(f'Fitting: {i + 1}/{h} rows done...')
+            status_text.text(f'Processing: {i + 1}/{h} rows...')
 
-    intensity = binned.sum(axis=2)
     return map_a1, map_T1, map_T2, map_Tm, intensity
+
+# ============================================================
+# CELLPOSE
+# ============================================================
 
 def normalize_image(img):
     p1, p99 = np.percentile(img, 1), np.percentile(img, 99)
@@ -102,7 +119,12 @@ def run_cellpose(intensity):
     )
     return masks, img_norm
 
-def extract_per_cell(masks, intensity, map_a1, map_T1, map_T2, map_Tm, group_name, file_num):
+# ============================================================
+# ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ ПО КЛЕТКАМ
+# ============================================================
+
+def extract_per_cell(masks, intensity, map_a1, map_T1, map_T2, map_Tm,
+                     group_name, file_num):
     rows    = []
     n_cells = masks.max()
 
@@ -149,6 +171,10 @@ def extract_per_cell(masks, intensity, map_a1, map_T1, map_T2, map_Tm, group_nam
         })
 
     return pd.DataFrame(rows)
+
+# ============================================================
+# КАРТИНКА С МАСКАМИ
+# ============================================================
 
 def build_mask_figure(img_norm, masks):
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
@@ -241,24 +267,21 @@ def render_sdt_workflow(export_basename: str):
     if not st.button("▶ Start analysis", type="primary"):
         return
 
-    # Шаг 1 — загрузка и binning
-    with st.spinner("Reading file and binning..."):
+    # Шаг 1 — загрузка
+    with st.spinner("Reading file..."):
         data, times = load_sdt(uploaded.getvalue())
-        binned      = run_binning(data, bin_size)
-        del data
-        gc.collect()
-    st.success(f"✓ File read — {binned.shape[0]}×{binned.shape[1]} pixels")
+    st.success(f"✓ File read — {data.shape[0]}×{data.shape[1]} pixels")
 
-    # Шаг 2 — fitting
+    # Шаг 2 — binning + fitting построчно
     st.markdown("**Fitting decay curves...**")
-    st.caption("This will take a few minutes.")
+    st.caption("Processing row by row to save memory. This will take a few minutes.")
     progress    = st.progress(0)
     status_text = st.empty()
 
-    map_a1, map_T1, map_T2, map_Tm, intensity = run_fitting(
-        binned, times, n_photons_min, progress, status_text
+    map_a1, map_T1, map_T2, map_Tm, intensity = run_binning_and_fitting(
+        data, times, bin_size, n_photons_min, progress, status_text
     )
-    del binned
+    del data
     gc.collect()
     status_text.empty()
     st.success("✓ Fitting done!")
@@ -268,7 +291,7 @@ def render_sdt_workflow(export_basename: str):
         masks, img_norm = run_cellpose(intensity)
     st.success(f"✓ Found: **{masks.max()} cells**")
 
-    # Шаг 4 — картинка с масками
+    # Шаг 4 — картинка
     st.markdown("**Cell masks — visual check**")
     fig = build_mask_figure(img_norm, masks)
     st.pyplot(fig, use_container_width=True)
