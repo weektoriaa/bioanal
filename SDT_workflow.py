@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from io import BytesIO
 import tempfile, os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.optimize import curve_fit
 from scipy.ndimage import uniform_filter, binary_dilation, label
 from cellpose import models as cellpose_models
@@ -78,7 +78,7 @@ def run_fitting_parallel(binned, times, n_photons_min=50, progress_bar=None, sta
     map_Tm = np.full((h, w), np.nan)
 
     completed = 0
-    with ProcessPoolExecutor() as executor:
+   with ThreadPoolExecutor() as executor:
         futures = {executor.submit(fit_row, args): args[0] for args in args_list}
         for future in as_completed(futures):
             row_idx, row_results = future.result()
