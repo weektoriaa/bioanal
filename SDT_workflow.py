@@ -1,12 +1,11 @@
-# sdt_workflow.py
+# SDT_workflow.py
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 from io import BytesIO
-import tempfile, os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile, os, gc
 from scipy.optimize import curve_fit
 from scipy.ndimage import uniform_filter, binary_dilation, label
 from cellpose import models as cellpose_models
@@ -65,31 +64,27 @@ def load_sdt(file_bytes):
 def run_binning(data, bin_size=3):
     return uniform_filter(data, size=(bin_size, bin_size, 1)) * (bin_size ** 2)
 
-def run_fitting_parallel(binned, times, n_photons_min=50, progress_bar=None, status_text=None):
-    h, w      = binned.shape[:2]
-    args_list = [(i, binned[i], times, n_photons_min) for i in range(h)]
+def run_fitting(binned, times, n_photons_min=50, progress_bar=None, status_text=None):
+    """Построчный fitting — экономит память на облаке"""
+    h, w = binned.shape[:2]
 
     map_a1 = np.full((h, w), np.nan)
     map_T1 = np.full((h, w), np.nan)
     map_T2 = np.full((h, w), np.nan)
     map_Tm = np.full((h, w), np.nan)
 
-    completed = 0
-    with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(fit_row, args): args[0] for args in args_list}
-        for future in as_completed(futures):
-            row_idx, row_results = future.result()
-            for j, res in enumerate(row_results):
-                if res:
-                    map_a1[row_idx, j] = res[0]
-                    map_T1[row_idx, j] = res[1]
-                    map_T2[row_idx, j] = res[2]
-                    map_Tm[row_idx, j] = res[3]
-            completed += 1
-            if progress_bar is not None:
-                progress_bar.progress(completed / h)
-            if status_text is not None:
-                status_text.text(f'Fitting: {completed}/{h} rows done...')
+    for i in range(h):
+        _, row_results = fit_row((i, binned[i], times, n_photons_min))
+        for j, res in enumerate(row_results):
+            if res:
+                map_a1[i, j] = res[0]
+                map_T1[i, j] = res[1]
+                map_T2[i, j] = res[2]
+                map_Tm[i, j] = res[3]
+        if progress_bar is not None:
+            progress_bar.progress((i + 1) / h)
+        if status_text is not None:
+            status_text.text(f'Fitting: {i + 1}/{h} rows done...')
 
     intensity = binned.sum(axis=2)
     return map_a1, map_T1, map_T2, map_Tm, intensity
@@ -246,34 +241,41 @@ def render_sdt_workflow(export_basename: str):
     if not st.button("▶ Start analysis", type="primary"):
         return
 
+    # Шаг 1 — загрузка и binning
     with st.spinner("Reading file and binning..."):
         data, times = load_sdt(uploaded.getvalue())
         binned      = run_binning(data, bin_size)
         del data
+        gc.collect()
     st.success(f"✓ File read — {binned.shape[0]}×{binned.shape[1]} pixels")
 
+    # Шаг 2 — fitting
     st.markdown("**Fitting decay curves...**")
     st.caption("This will take a few minutes.")
     progress    = st.progress(0)
     status_text = st.empty()
 
-    map_a1, map_T1, map_T2, map_Tm, intensity = run_fitting_parallel(
+    map_a1, map_T1, map_T2, map_Tm, intensity = run_fitting(
         binned, times, n_photons_min, progress, status_text
     )
     del binned
+    gc.collect()
     status_text.empty()
     st.success("✓ Fitting done!")
 
+    # Шаг 3 — Cellpose
     with st.spinner("Cellpose is finding your cells..."):
         masks, img_norm = run_cellpose(intensity)
     st.success(f"✓ Found: **{masks.max()} cells**")
 
+    # Шаг 4 — картинка с масками
     st.markdown("**Cell masks — visual check**")
     fig = build_mask_figure(img_norm, masks)
     st.pyplot(fig, use_container_width=True)
     pdf_buf = fig_to_pdf(fig)
     plt.close(fig)
 
+    # Шаг 5 — параметры по клеткам
     with st.spinner("Extracting parameters per cell..."):
         df = extract_per_cell(
             masks, intensity, map_a1, map_T1, map_T2, map_Tm,
@@ -284,6 +286,7 @@ def render_sdt_workflow(export_basename: str):
     st.markdown("**Results**")
     st.dataframe(df, use_container_width=True)
 
+    # Шаг 6 — экспорт
     export_name = f"{export_basename}_{group_name}_file{int(file_num)}"
     excel_buf   = df_to_excel(df)
 
