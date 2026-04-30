@@ -1238,5 +1238,5 @@ else:
             """,
             unsafe_allow_html=True,
         )
-        from SDT_workflow import render_SDT_workflow
-        render_SDT_workflow(export_basename)
+        from SDT_workflow import render_sdt_workflow
+        render_sdt_workflow(export_basename)
