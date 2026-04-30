@@ -8,3 +8,4 @@ statsmodels>=0.14
 tifffile>=2024.2
 scikit-image>=0.22
 cellpose>=3.0
+sdtfile>=2024.1
